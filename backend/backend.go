@@ -60,7 +60,7 @@ func shortenURL(conn *pgx.Conn) http.HandlerFunc {
 
 		resp := ShortenResponse{
 			ShortCode: shortCode,
-			ShortURL:  "http://localhost:8080/" + shortCode,
+			ShortURL:  "https://urlshortnergolang-production.up.railway.app/" + shortCode,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
