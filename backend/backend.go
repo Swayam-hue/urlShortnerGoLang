@@ -1,16 +1,18 @@
 package main
+
 import (
-	"crypto/sha256"
 	"context"
+	"encoding/json"
 	"fmt"
-	"os"
-	"github.com/jackc/pgx/v5"
-	"github.com/joho/godotenv"
-	"github.com/jxskiss/base62"
 	"log"
 	"net/http"
-	"encoding/json"
+	"os"
 	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
 type ShortenRequest struct {
@@ -22,7 +24,36 @@ type ShortenResponse struct {
 	ShortURL  string `json:"short_url"`
 }
 
-func shortenURL(conn *pgx.Conn) http.HandlerFunc {
+const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func encodeBase62(num int64) string {
+
+	if num == 0 {
+		return "0"
+	}
+
+	var result []byte
+
+	for num > 0 {
+
+		rem := num % 62
+
+		result = append(
+			[]byte{BASE62[rem]},
+			result...,
+		)
+
+		num /= 62
+	}
+
+	return string(result)
+}
+
+func shortenURL(
+	pool *pgxpool.Pool,
+	rdb *redis.Client,
+) http.HandlerFunc {
+
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method != http.MethodPost {
@@ -38,17 +69,56 @@ func shortenURL(conn *pgx.Conn) http.HandlerFunc {
 			return
 		}
 
-		h := sha256.New()
-		h.Write([]byte(req.URL))
+		ctx := context.Background()
 
-		hash := h.Sum(nil)
-		shortCode := base62.EncodeToString(hash)[:8]
 
-		_, err = conn.Exec(
-			context.Background(),
-			`INSERT INTO urltable_2(shortcode,longurl)
-			 VALUES($1,$2)
-			 ON CONFLICT(shortcode) DO NOTHING`,
+		var existingCode string
+
+		err = pool.QueryRow(
+			ctx,
+			`
+			SELECT shortcode
+			FROM urltable_2
+			WHERE longurl = $1
+			`,
+			req.URL,
+		).Scan(&existingCode)
+
+		if err == nil {
+
+			resp := ShortenResponse{
+				ShortCode: existingCode,
+				ShortURL: os.Getenv("BASE_URL") + "/" + existingCode,
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+
+		counter, err := rdb.Incr(
+			ctx,
+			"url_counter",
+		).Result()
+
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		shortCode := encodeBase62(counter)
+
+
+		_, err = pool.Exec(
+			ctx,
+			`
+			INSERT INTO urltable_2(
+				shortcode,
+				longurl
+			)
+			VALUES($1,$2)
+			`,
 			shortCode,
 			req.URL,
 		)
@@ -58,9 +128,17 @@ func shortenURL(conn *pgx.Conn) http.HandlerFunc {
 			return
 		}
 
+
+		rdb.Set(
+			ctx,
+			"url:"+shortCode,
+			req.URL,
+			24*time.Hour,
+		)
+
 		resp := ShortenResponse{
 			ShortCode: shortCode,
-			ShortURL:  "https://urlshortnergolang-production.up.railway.app/" + shortCode,
+			ShortURL: os.Getenv("BASE_URL") + "/" + shortCode,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -68,21 +146,57 @@ func shortenURL(conn *pgx.Conn) http.HandlerFunc {
 	}
 }
 
-func redirectHandler(conn *pgx.Conn) http.HandlerFunc {
+func redirectHandler(
+	pool *pgxpool.Pool,
+	rdb *redis.Client,
+) http.HandlerFunc {
+
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		code := strings.TrimPrefix(r.URL.Path, "/")
+		code := strings.TrimPrefix(
+			r.URL.Path,
+			"/",
+		)
 
 		if code == "" {
 			http.Error(w, "Missing shortcode", 400)
 			return
 		}
 
+		ctx := context.Background()
+
+
+		cachedURL, err := rdb.Get(
+			ctx,
+			"url:"+code,
+		).Result()
+
+		if err == nil {
+
+			fmt.Println("CACHE HIT")
+
+			http.Redirect(
+				w,
+				r,
+				cachedURL,
+				http.StatusFound,
+			)
+
+			return
+		}
+
+		fmt.Println("CACHE MISS")
+
+
 		var longURL string
 
-		err := conn.QueryRow(
-			context.Background(),
-			"SELECT longurl FROM urltable_2 WHERE shortcode=$1",
+		err = pool.QueryRow(
+			ctx,
+			`
+			SELECT longurl
+			FROM urltable_2
+			WHERE shortcode = $1
+			`,
 			code,
 		).Scan(&longURL)
 
@@ -91,31 +205,78 @@ func redirectHandler(conn *pgx.Conn) http.HandlerFunc {
 			return
 		}
 
-		http.Redirect(w, r, longURL, http.StatusFound)
+		
+
+		rdb.Set(
+			ctx,
+			"url:"+code,
+			longURL,
+			24*time.Hour,
+		)
+
+		http.Redirect(
+			w,
+			r,
+			longURL,
+			http.StatusFound,
+		)
 	}
 }
 
-
-
 func main() {
 
-	// load .env
 	godotenv.Load()
-
-	connString := os.Getenv("DATABASE_URL")
 
 	ctx := context.Background()
 
-	conn, err := pgx.Connect(ctx, connString)
+	dbURL := os.Getenv("DATABASE_URL")
+
+	pool, err := pgxpool.New(
+		ctx,
+		dbURL,
+	)
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close(ctx)
 
-	http.HandleFunc("/shorten", shortenURL(conn))
-	http.HandleFunc("/", redirectHandler(conn))
+	defer pool.Close()
+
+	redisURL := os.Getenv("REDIS_URL")
+
+	opt, err := redis.ParseURL(redisURL)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	rdb := redis.NewClient(opt)
+
+	_, err = rdb.Ping(ctx).Result()
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Redis Connected")
+
+
+	http.HandleFunc(
+		"/shorten",
+		shortenURL(pool, rdb),
+	)
+
+	http.HandleFunc(
+		"/",
+		redirectHandler(pool, rdb),
+	)
 
 	fmt.Println("Server running on :8080")
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(
+		http.ListenAndServe(
+			":8080",
+			nil,
+		),
+	)
 }
